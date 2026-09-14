@@ -62,10 +62,20 @@ def _backfill_via_bulk(
 
 
 def _backfill_via_per_ticker(
-    universe: list[dict], from_date: date, to_date: date, log: list[str]
+    universe: list[dict],
+    from_date: date,
+    to_date: date,
+    log: list[str],
+    max_tickers: int | None = None,
+    ticker_offset: int = 0,
 ) -> None:
-    total = len(universe)
-    for idx, u in enumerate(universe, start=1):
+    universe_slice = universe[ticker_offset:]
+    targets = universe_slice[:max_tickers] if max_tickers else universe_slice
+    total = len(targets)
+    log.append(
+        f"(종목 {ticker_offset}~{ticker_offset + total}번째, 전체 {len(universe)}종목 중 {total}개 처리)"
+    )
+    for idx, u in enumerate(targets, start=1):
         symbol = u["symbol"]
         series = fetch_light_chart(symbol, from_date, to_date)
         by_date: dict[str, dict[str, float]] = {}
@@ -79,11 +89,22 @@ def _backfill_via_per_ticker(
         time.sleep(0.15)
 
 
-def run_backfill(*, days: int = 5, offset: int = 0) -> dict[str, Any]:
+def run_backfill(
+    *, days: int = 5, offset: int = 0, max_tickers: int | None = 30, ticker_offset: int = 0
+) -> dict[str, Any]:
     """
     오늘로부터 offset거래일만큼 건너뛴 지점부터, days거래일치를 백필한다.
     예: offset=0,days=50 → 가장 최근 50거래일 / offset=50,days=50 → 그 다음 50거래일.
     무료 플랜의 요청 타임아웃을 피하려면 한 번 호출당 days를 50 이하로 유지할 것.
+
+    벌크 엔드포인트가 이 플랜에서 안 되면 종목별 폴백으로 전환되는데, 이 경로는 속도가
+    "며칠치를 받아오는가"가 아니라 "몇 종목을 처리하는가"에 좌우된다. 그래서 폴백 시에는
+    max_tickers/ticker_offset으로 종목 단위로 나눠서 여러 번 호출하는 걸 전제로 한다.
+
+    :param max_tickers: 폴백 경로에서 이번 호출에 처리할 종목 수. 기본값 30(안전한 시험 크기).
+        전체 유니버스를 다 처리하려면 None으로 명시하되, 무료 플랜에서는 요청이 타임아웃날
+        가능성이 높으므로 권장하지 않는다 — 대신 ticker_offset을 늘려가며 여러 번 호출할 것.
+    :param ticker_offset: 유니버스 목록에서 몇 번째 종목부터 시작할지 (여러 번 호출로 나눠 처리할 때 사용).
     """
     log: list[str] = []
     log.append("1) 스키마 확인/생성")
@@ -105,8 +126,11 @@ def run_backfill(*, days: int = 5, offset: int = 0) -> dict[str, Any]:
     log.append(f"3) 가격 백필 ({trading_days[-1]} ~ {trading_days[0]}, {len(trading_days)}거래일)")
     bulk_ok = _backfill_via_bulk(trading_days, universe_symbols, log)
     if not bulk_ok:
-        log.append("4) 종목별 방식으로 백필 (시간이 걸릴 수 있습니다)")
-        _backfill_via_per_ticker(universe, trading_days[-1], trading_days[0], log)
+        log.append("4) 종목별 방식으로 백필")
+        _backfill_via_per_ticker(
+            universe, trading_days[-1], trading_days[0], log,
+            max_tickers=max_tickers, ticker_offset=ticker_offset,
+        )
 
     log.append("5) RS 백분위/업종 순위 재계산")
     updated = recompute_rankings()
