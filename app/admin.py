@@ -17,7 +17,7 @@ import os
 from fastapi import APIRouter, HTTPException, Query
 
 from app.backfill import run_backfill, run_daily_update
-from app.db import DatabaseError
+from app.db import DatabaseError, get_connection
 
 router = APIRouter(prefix="/admin")
 
@@ -53,5 +53,47 @@ def admin_daily_update(token: str = Query(...)) -> dict:
     _check_token(token)
     try:
         return run_daily_update()
+    except DatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get("/status")
+def admin_status(token: str = Query(...)) -> dict:
+    """
+    지금까지 얼마나 쌓였는지 한 번에 확인한다. 개별 curl 회차가 성공/실패했는지
+    스크롤로 뒤지는 대신, 이 엔드포인트 하나로 전체 진행 상황을 본다.
+    """
+    _check_token(token)
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM nasdaq_universe")
+                universe_count = cur.fetchone()[0]
+
+                cur.execute(
+                    "SELECT count(DISTINCT symbol), count(DISTINCT price_date), "
+                    "min(price_date), max(price_date), count(*) FROM daily_price"
+                )
+                symbols_with_price, distinct_dates, min_date, max_date, total_rows = cur.fetchone()
+
+                cur.execute(
+                    "SELECT symbol, count(*) AS days FROM daily_price GROUP BY symbol "
+                    "ORDER BY days DESC LIMIT 1"
+                )
+                fullest = cur.fetchone()
+
+                cur.execute("SELECT count(*) FROM rs_rating_daily")
+                rs_rows = cur.fetchone()[0]
+
+        return {
+            "universe_symbols": universe_count,
+            "symbols_with_price_data": symbols_with_price,
+            "symbols_still_missing": universe_count - symbols_with_price,
+            "distinct_trading_days_stored": distinct_dates,
+            "price_date_range": [str(min_date), str(max_date)] if min_date else None,
+            "most_complete_symbol": {"symbol": fullest[0], "days_stored": fullest[1]} if fullest else None,
+            "total_price_rows": total_rows,
+            "rs_rating_rows": rs_rows,
+        }
     except DatabaseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
