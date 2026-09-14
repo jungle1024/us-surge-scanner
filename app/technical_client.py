@@ -72,3 +72,47 @@ def get_latest_sma(ticker: str, period: int) -> float | None:
     result = float(value) if value is not None else None
     _cache[cache_key] = (now, result)
     return result
+
+
+def get_sma_trend(ticker: str, period: int, lookback_days: int = 21) -> tuple[float, float] | None:
+    """
+    (최신 SMA, lookback_days 거래일 전 SMA)를 반환한다. 미너비니 조건 중
+    "200일선이 최소 1개월간 상승 추세"를 판정하는 데 쓴다 (기본 21거래일 ≈ 1개월).
+    데이터가 부족하거나 조회 실패 시 None.
+    """
+    cache_key = f"trend:{ticker}:{period}:{lookback_days}"
+    now = time.time()
+    cached = _cache.get(cache_key)
+    if cached is not None and now - cached[0] < _CACHE_TTL_SECONDS:
+        return cached[1]  # type: ignore[return-value]
+
+    token = _get_token()
+    try:
+        resp = requests.get(
+            f"{UW_BASE_URL}/api/stock/{ticker}/technical-indicator/SMA",
+            params={"interval": "daily", "time_period": period},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return None
+
+    if not resp.ok:
+        _cache[cache_key] = (now, None)
+        return None
+
+    body = resp.json()
+    rows = body.get("data", body) if isinstance(body, dict) else body
+    if not rows or len(rows) <= lookback_days:
+        _cache[cache_key] = (now, None)
+        return None
+
+    latest = rows[0].get("values", {}).get("SMA")
+    past = rows[lookback_days].get("values", {}).get("SMA")
+    if latest is None or past is None:
+        _cache[cache_key] = (now, None)
+        return None
+
+    result = (float(latest), float(past))
+    _cache[cache_key] = (now, result)
+    return result

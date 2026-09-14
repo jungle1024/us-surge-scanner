@@ -12,4 +12,6 @@ services:
         sync: false
       - key: FMP_API_KEY
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
     autoDeploy: true

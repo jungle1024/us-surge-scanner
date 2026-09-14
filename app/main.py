@@ -103,7 +103,7 @@ def api_scan(
 
 
 def _render_rows_html(rows: list[dict[str, Any]], strategy: Strategy) -> str:
-    colspan = {"surge": 6, "volume_breakout": 7, "minervini": 8, "canslim": 8}[strategy]
+    colspan = {"surge": 6, "volume_breakout": 7, "minervini": 9, "canslim": 10}[strategy]
     if not rows:
         return f"<tr><td colspan='{colspan}' style='text-align:center;padding:24px;color:#888;'>조건에 맞는 나스닥 종목이 없습니다.</td></tr>"
 
@@ -131,11 +131,15 @@ def _render_rows_html(rows: list[dict[str, Any]], strategy: Strategy) -> str:
         elif strategy == "minervini":
             base += (
                 f"<td>{fmt(r.get('sma_50'), '.2f')} / {fmt(r.get('sma_150'), '.2f')} / {fmt(r.get('sma_200'), '.2f')}</td>"
+                f"<td>{esc(r.get('sma_200_rising'))}</td>"
                 f"<td>{esc(r.get('minervini_pass'))}</td>"
             )
         elif strategy == "canslim":
             base += (
                 f"<td>{fmt(r.get('eps_quarterly_yoy_pct'), '+.1f')}% / {fmt(r.get('eps_annual_yoy_pct'), '+.1f')}%</td>"
+                f"<td>{esc(r.get('market_bullish'))}</td>"
+                f"<td>{fmt(r.get('institutional_ownership_pct_change'), '+.2f')}%p</td>"
+                f"<td title='{esc(r.get('new_catalyst_reason'))}'>{esc(r.get('new_catalyst'))}</td>"
                 f"<td>{esc(r.get('canslim_pass'))}</td>"
             )
         base += "</tr>"
@@ -178,7 +182,9 @@ def _render_summary(
             a = top.get("eps_annual_yoy_pct")
             q_str = f"{q:+.1f}%" if isinstance(q, (int, float)) else "-"
             a_str = f"{a:+.1f}%" if isinstance(a, (int, float)) else "-"
-            lines.append(f"<p>실적 성장이 가장 뚜렷한 종목은 <b>{ticker}</b>(분기 EPS {q_str}, 연간 EPS {a_str})입니다.</p>")
+            reason = top.get("new_catalyst_reason")
+            reason_str = f" (Claude 판단: {reason})" if reason else ""
+            lines.append(f"<p>실적 성장이 가장 뚜렷한 종목은 <b>{ticker}</b>(분기 EPS {q_str}, 연간 EPS {a_str}){reason_str}입니다.</p>")
 
     return "".join(lines)
 
@@ -193,8 +199,8 @@ _STRATEGY_LABELS = {
 _STRATEGY_DESCRIPTIONS = {
     "surge": "오늘 등락률·거래량이 급격히 튄 나스닥 종목을 그대로 모아 보여줍니다. 추가 판정 없이 순위만 매깁니다.",
     "volume_breakout": "급등 후보 중에서도 52주 신고가 근처(10% 이내)까지 도달한 종목만 골라냅니다. '많이 올랐지만 아직 눌려있는' 종목과 '신고가를 뚫는' 종목을 구분합니다.",
-    "minervini": "이동평균(50/150/200일)이 짧은 기간일수록 위에 있는 정배열 구조인 종목만 골라냅니다. 마크 미너비니의 추세 템플릿을 5개 핵심 조건으로 간이 적용했습니다.",
-    "canslim": "최근 분기·연간 EPS 성장률이 각각 25% 이상인 종목만 골라냅니다. 윌리엄 오닐의 CANSLIM 중 실적 관련 3개 요소(C·A·S)를 간이 적용했습니다.",
+    "minervini": "이동평균(50/150/200일)이 짧은 기간일수록 위에 있는 정배열 구조이면서, 200일선이 1개월 이상 상승 추세인 종목만 골라냅니다. 마크 미너비니의 추세 템플릿을 6개 핵심 조건으로 간이 적용했습니다.",
+    "canslim": "실적 성장(C·A), 거래량(S), 시장 전체 방향(M), 기관 매수(I), 뉴스 속 신규 촉매(N, Claude가 판정)까지 6개 조건을 모두 만족하는 종목만 골라냅니다. 윌리엄 오닐의 CANSLIM 7개 요소 중 업종 리더십(L)만 제외하고 간이 적용했습니다.",
 }
 
 _STRATEGY_ICONS = {
@@ -207,8 +213,8 @@ _STRATEGY_ICONS = {
 _STRATEGY_EXTRA_HEADERS = {
     "surge": "",
     "volume_breakout": "<th>52주 고점 대비</th>",
-    "minervini": "<th>SMA 50/150/200</th><th>미너비니 통과</th>",
-    "canslim": "<th>EPS 성장(분기/연간)</th><th>CANSLIM 통과</th>",
+    "minervini": "<th>SMA 50/150/200</th><th>200일선 상승중</th><th>미너비니 통과</th>",
+    "canslim": "<th>EPS 성장(분기/연간)</th><th>시장 방향(M)</th><th>기관 보유 변화(I)</th><th>신규 촉매(N)</th><th>CANSLIM 통과</th>",
 }
 
 

@@ -13,18 +13,22 @@ UW(Unusual Whales)와 FMP(Financial Modeling Prep)의 **공식 REST API**만 사
 2. **FMP** `/stable/profile` — 후보 종목 각각의 상장 거래소를 확인해서 NASDAQ인 것만 남깁니다.
 3. 결과를 30초 TTL로 캐시해서 API 호출 횟수를 아낍니다.
 
-## 필요한 API 키 2개
+## 필요한 API 키 3개
 
 | 키 | 어디서 발급 | 환경변수 이름 |
 |---|---|---|
-| UW API 토큰 | https://unusualwhales.com/information/how-to-check-your-api-usage | `UW_API_KEY` |
+| UW API 키 | https://unusualwhales.com/information/how-to-check-your-api-usage | `UW_API_KEY` |
 | FMP API 키 | FMP 대시보드(기존 급등주 발굴 V1에서 쓰던 키 재사용 가능) | `FMP_API_KEY` |
+| Anthropic API 키 | https://console.anthropic.com | `ANTHROPIC_API_KEY` |
+
+Anthropic API 키는 CANSLIM 방법론의 'N'(신규 촉매) 판정에만 쓰입니다 — 없어도 나머지 기능은 전부 정상 작동하고, N 항목만 판정 불가(None)로 표시됩니다.
 
 ## 로컬 실행
 
 ```bash
 export UW_API_KEY=여기에_UW_토큰
 export FMP_API_KEY=여기에_FMP_키
+export ANTHROPIC_API_KEY=여기에_Anthropic_키   # 없어도 실행되지만 CANSLIM의 N 판정만 빠짐
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
@@ -82,10 +86,17 @@ GET /api/scan?min_change_pct=10&min_rel_volume=2&limit=30
 
 - **surge** (기본값): 추가 조건 없음. 순수 등락률·거래량 급등주.
 - **volume_breakout**: 52주 신고가 대비 10% 이내 + 거래량 실림. 추가 API 호출 없음(1차 스캔 데이터로 판정).
-- **minervini**: 미너비니 추세 템플릿을 5개 조건으로 간이 적용 — 현재가 > 50일선 > 150일선 > 200일선 정배열, 52주 저점 대비 30%+ 상승, 52주 고점 대비 25% 이내. 상위 15개 후보에 대해서만 UW 이동평균(SMA)을 조회합니다(종목당 3회 호출).
-- **canslim**: CANSLIM을 3개 요소(C·A·S)로 간이 적용 — 분기 EPS 전년동기 대비 25%+ 성장, 연간 EPS 전년 대비 25%+ 성장, 상대거래량 1.5배 이상. 상위 15개 후보에 대해서만 FMP 재무제표를 조회합니다(종목당 2회 호출).
+- **minervini**: 미너비니 추세 템플릿을 6개 조건으로 간이 적용 — 현재가 > 50일선 > 150일선 > 200일선 정배열, 52주 저점 대비 30%+ 상승, 52주 고점 대비 25% 이내, 200일선 1개월 이상 상승 추세. 상위 15개 후보에 대해서만 UW 이동평균(SMA)을 조회합니다(종목당 4회 호출).
+- **canslim**: CANSLIM을 6개 요소(C·A·S·M·I·N, L만 제외)로 간이 적용:
+  - **C·A**: 분기·연간 EPS 전년 대비 25%+ 성장 (FMP 재무제표)
+  - **S**: 상대거래량 1.5배 이상 (1차 스캔 데이터)
+  - **M**: 나스닥 대표 ETF(QQQ)가 50일선 위 — 시장 전체가 상승 국면일 때만 통과 (스캔당 1회만 계산, 전 종목 공통 적용)
+  - **I**: 기관 보유 비중이 직전 분기 대비 증가 (FMP 13F 데이터)
+  - **N**: 최근 뉴스에 신제품·신경영진 등 새로운 촉매가 있는지 **Claude(Anthropic API)가 헤드라인을 읽고 판정**
+  - **L**(업종 내 상대강도 리더십)은 나스닥 전 종목의 상대강도 순위가 필요해 이 구조로는 계산할 수 없어 제외했습니다. 전체 종목 시계열을 저장하고 매일 배치로 순위를 매기는 인프라(DB+스케줄러)가 있어야 가능합니다.
+  - 상위 8개 후보에만 적용(종목당 FMP 3회 + 뉴스 1회 + Claude 1회 호출 — 미너비니보다 훨씬 느립니다).
 
-⚠️ `minervini`/`canslim`은 원래 방법론(미너비니 8개 조건, CANSLIM 7개 글자)을 그대로 구현한 것이 아니라, 현재 API로 계산 가능한 핵심 조건만 추린 **간이 버전**입니다. 정밀한 매매 판단 근거로 쓰기보다는 후보를 좁히는 참고 지표로 활용하세요.
+⚠️ `minervini`/`canslim`은 원래 방법론을 그대로 구현한 것이 아니라, 현재 API로 계산 가능한 핵심 조건만 추린 **간이 버전**입니다. 정밀한 매매 판단 근거로 쓰기보다는 후보를 좁히는 참고 지표로 활용하세요. 특히 'N' 판정은 Claude가 최근 뉴스 헤드라인 몇 개만 보고 내리는 판단이라 오판이 있을 수 있습니다.
 
 예시:
 ```

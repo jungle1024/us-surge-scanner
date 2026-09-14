@@ -14,16 +14,23 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.fmp_client import FMPClientError, filter_by_exchange
+from app.anthropic_client import judge_new_catalyst
+from app.fmp_client import FMPClientError, filter_by_exchange, get_institutional_ownership_trend
 from app.fundamentals_client import FundamentalsClientError, get_eps_growth
-from app.technical_client import TechnicalClientError, get_latest_sma
+from app.market_client import MarketClientError, get_market_direction
+from app.news_client import NewsClientError, fetch_recent_headlines
+from app.technical_client import TechnicalClientError, get_latest_sma, get_sma_trend
 from app.uw_client import UWClientError, fetch_stock_screener
 
 CACHE_TTL_SECONDS = 30
 
-# 미너비니/CANSLIM은 후보 1개당 UW·FMP를 여러 번 호출하므로, 응답 시간과 API 사용량을
+# 미너비니는 후보 1개당 UW를 여러 번 호출하므로, 응답 시간과 API 사용량을
 # 통제하기 위해 이미 등락률 순으로 정렬된 상위 N개 후보에만 적용한다.
 STRATEGY_ENRICH_LIMIT = 15
+
+# CANSLIM은 종목당 FMP 호출 3회 + 뉴스 조회 + Claude 호출까지 붙어서 더 느리고 비싸다.
+# 응답 시간을 감당할 수 있는 수준으로 더 적게 적용한다.
+CANSLIM_ENRICH_LIMIT = 8
 
 # UW 후보를 몇 배수로 넉넉히 뽑을지. 나스닥이 아닌 종목이 섞여 있어서 걸러내고 나면
 # 줄어들기 때문에, 최종 limit보다 넉넉히 가져와야 한다.
@@ -209,12 +216,13 @@ def apply_volume_breakout_filter(
 
 def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    미너비니 추세 템플릿(Trend Template)을 간이 적용한다 (원래 8개 조건 중 5개로 축약):
+    미너비니 추세 템플릿(Trend Template)을 간이 적용한다 (원래 8개 조건 중 6개로 축약):
     1. 현재가 > 50일선 > 150일선 > 200일선 (정배열)
     2. 현재가가 52주 저점 대비 30% 이상 상승
     3. 현재가가 52주 고점 대비 25% 이내
+    4. 200일선이 최소 1개월(21거래일)간 상승 추세
 
-    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(UW 호출 3회/종목).
+    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(UW 호출 4회/종목).
     minervini_pass가 True/False/None(데이터 부족으로 판정 불가)인 채로 전체를 반환한다 —
     걸러내는 건 호출부에서 원하는 대로 하도록.
     """
@@ -229,17 +237,24 @@ def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             sma_50 = get_latest_sma(ticker, 50)
             sma_150 = get_latest_sma(ticker, 150)
             sma_200 = get_latest_sma(ticker, 200)
+            sma_200_trend = get_sma_trend(ticker, 200, lookback_days=21)
         except TechnicalClientError as exc:
             raise ScannerError(f"미너비니 지표 조회 실패({ticker}): {exc}") from exc
 
+        sma_200_rising = None
+        if sma_200_trend is not None:
+            sma_200_now, sma_200_past = sma_200_trend
+            sma_200_rising = sma_200_now > sma_200_past
+
         minervini_pass = None
-        if None not in (close, sma_50, sma_150, sma_200, week_52_high, week_52_low):
+        if None not in (close, sma_50, sma_150, sma_200, week_52_high, week_52_low, sma_200_rising):
             above_low_pct = (close - week_52_low) / week_52_low * 100
             below_high_pct = (week_52_high - close) / week_52_high * 100
             minervini_pass = (
                 close > sma_50 > sma_150 > sma_200
                 and above_low_pct >= 30
                 and below_high_pct <= 25
+                and sma_200_rising
             )
 
         result.append({
@@ -247,6 +262,7 @@ def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "sma_50": sma_50,
             "sma_150": sma_150,
             "sma_200": sma_200,
+            "sma_200_rising": sma_200_rising,
             "minervini_pass": minervini_pass,
         })
     return result
@@ -254,16 +270,26 @@ def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    CANSLIM 스타일을 간이 적용한다 (7글자 중 C·A·S 3개로 축약):
+    CANSLIM 스타일을 간이 적용한다 (7글자 중 C·A·S·M·I·N 6개로 확장, L만 제외):
     - C: 최근 분기 EPS가 전년 동기 대비 25% 이상 성장
     - A: 최근 회계연도 EPS가 전년 대비 25% 이상 성장
-    - S: 상대거래량 1.5배 이상 (수급 — 이미 1차 스크리닝 조건으로 충족된 경우가 많음)
+    - S: 상대거래량 1.5배 이상 (수급)
+    - M: 시장 전체(QQQ)가 50일선 위 — 상승장에서만 유효한 전략이라는 원 취지를 반영
+    - I: 기관 보유 비중이 직전 분기 대비 증가
+    - N: 최근 뉴스에 '새로운 촉매'(신제품/신경영진/긍정적 이벤트 등)가 있는지 Claude가 판정
+    - L(업종 내 상대강도 리더십)은 나스닥 전 종목 순위가 필요해 이 구조로는 계산할 수 없어 제외.
 
-    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(FMP 호출 2회/종목).
+    상위 CANSLIM_ENRICH_LIMIT개 후보에만 적용(종목당 FMP 3회 + 뉴스 1회 + Claude 1회 호출).
     canslim_pass가 True/False/None(데이터 부족)인 채로 전체를 반환한다.
     """
+    try:
+        market = get_market_direction()
+    except MarketClientError as exc:
+        raise ScannerError(f"CANSLIM 시장 방향(M) 판정 실패: {exc}") from exc
+    market_bullish = market["is_bullish"]
+
     result = []
-    for row in rows[:STRATEGY_ENRICH_LIMIT]:
+    for row in rows[:CANSLIM_ENRICH_LIMIT]:
         ticker = row.get("ticker")
         rel_volume = row.get("relative_volume")
 
@@ -271,18 +297,47 @@ def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             eps_growth = get_eps_growth(ticker)
         except FundamentalsClientError as exc:
             raise ScannerError(f"CANSLIM 지표 조회 실패({ticker}): {exc}") from exc
-
         quarterly_yoy = eps_growth["quarterly_yoy_pct"]
         annual_yoy = eps_growth["annual_yoy_pct"]
 
+        try:
+            ownership = get_institutional_ownership_trend(ticker)
+        except FMPClientError as exc:
+            raise ScannerError(f"CANSLIM 기관 보유(I) 조회 실패({ticker}): {exc}") from exc
+        ownership_pct_change = ownership["ownership_pct_change"]
+        institutional_buying = (
+            ownership_pct_change > 0 if ownership_pct_change is not None else None
+        )
+
+        try:
+            headlines = fetch_recent_headlines(ticker)
+        except NewsClientError as exc:
+            raise ScannerError(f"CANSLIM 뉴스(N) 조회 실패({ticker}): {exc}") from exc
+        new_catalyst = judge_new_catalyst(ticker, headlines)
+        is_new = new_catalyst["is_new"] if new_catalyst else None
+        new_catalyst_reason = new_catalyst["reason"] if new_catalyst else None
+
         canslim_pass = None
-        if None not in (quarterly_yoy, annual_yoy, rel_volume):
-            canslim_pass = quarterly_yoy >= 25 and annual_yoy >= 25 and rel_volume >= 1.5
+        conditions = (quarterly_yoy, annual_yoy, rel_volume, market_bullish, institutional_buying, is_new)
+        if None not in conditions:
+            canslim_pass = (
+                quarterly_yoy >= 25
+                and annual_yoy >= 25
+                and rel_volume >= 1.5
+                and market_bullish
+                and institutional_buying
+                and is_new
+            )
 
         result.append({
             **row,
             "eps_quarterly_yoy_pct": quarterly_yoy,
             "eps_annual_yoy_pct": annual_yoy,
+            "market_bullish": market_bullish,
+            "institutional_ownership_pct": ownership["ownership_pct"],
+            "institutional_ownership_pct_change": ownership_pct_change,
+            "new_catalyst": is_new,
+            "new_catalyst_reason": new_catalyst_reason,
             "canslim_pass": canslim_pass,
         })
     return result
