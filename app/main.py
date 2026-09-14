@@ -143,11 +143,65 @@ def _render_rows_html(rows: list[dict[str, Any]], strategy: Strategy) -> str:
     return "".join(cells)
 
 
+def _render_summary(
+    strategy: Strategy,
+    total_candidates: int,
+    nasdaq_count: int,
+    final_rows: list[dict[str, Any]],
+) -> str:
+    """상단에 표시할 '이 화면이 무엇을 찾은 결과인지' 요약 문단을 만든다."""
+    match_count = len(final_rows)
+    top = final_rows[0] if final_rows else None
+
+    lines = [f"<p>{_STRATEGY_DESCRIPTIONS[strategy]}</p>"]
+    lines.append(
+        f"<p>UW 1차 후보 <b>{total_candidates}개</b> → 나스닥 상장 <b>{nasdaq_count}개</b> "
+        f"→ 이 조건을 만족하는 종목 <b>{match_count}개</b>를 찾았습니다.</p>"
+    )
+
+    if match_count == 0:
+        lines.append("<p style='color:#888;'>지금 이 조건을 만족하는 종목이 없습니다. 조건이 너무 엄격하거나, 지금 시장에 마땅한 후보가 없는 상태일 수 있습니다.</p>")
+    elif top:
+        ticker = top.get("ticker")
+        change = top.get("change_pct")
+        change_str = f"{change:+.2f}%" if isinstance(change, (int, float)) else "-"
+        if strategy == "surge":
+            lines.append(f"<p>가장 두드러진 종목은 <b>{ticker}</b>({change_str})입니다.</p>")
+        elif strategy == "volume_breakout":
+            pct = top.get("pct_from_52w_high")
+            pct_str = f"{pct:.2f}%" if isinstance(pct, (int, float)) else "-"
+            lines.append(f"<p>가장 신고가에 가까운 종목은 <b>{ticker}</b>(52주 고점 대비 {pct_str}, 등락률 {change_str})입니다.</p>")
+        elif strategy == "minervini":
+            lines.append(f"<p>추세 템플릿을 통과한 종목 중 오늘 등락률이 가장 높은 건 <b>{ticker}</b>({change_str})입니다.</p>")
+        elif strategy == "canslim":
+            q = top.get("eps_quarterly_yoy_pct")
+            a = top.get("eps_annual_yoy_pct")
+            q_str = f"{q:+.1f}%" if isinstance(q, (int, float)) else "-"
+            a_str = f"{a:+.1f}%" if isinstance(a, (int, float)) else "-"
+            lines.append(f"<p>실적 성장이 가장 뚜렷한 종목은 <b>{ticker}</b>(분기 EPS {q_str}, 연간 EPS {a_str})입니다.</p>")
+
+    return "".join(lines)
+
+
 _STRATEGY_LABELS = {
     "surge": "순수 급등주(등락률·거래량)",
     "volume_breakout": "거래량 돌파(52주 신고가 근접)",
     "minervini": "미너비니 추세 템플릿(간이)",
     "canslim": "CANSLIM 스타일(간이)",
+}
+
+_STRATEGY_DESCRIPTIONS = {
+    "surge": "오늘 등락률·거래량이 급격히 튄 나스닥 종목을 그대로 모아 보여줍니다. 추가 판정 없이 순위만 매깁니다.",
+    "volume_breakout": "급등 후보 중에서도 52주 신고가 근처(10% 이내)까지 도달한 종목만 골라냅니다. '많이 올랐지만 아직 눌려있는' 종목과 '신고가를 뚫는' 종목을 구분합니다.",
+    "minervini": "이동평균(50/150/200일)이 짧은 기간일수록 위에 있는 정배열 구조인 종목만 골라냅니다. 마크 미너비니의 추세 템플릿을 5개 핵심 조건으로 간이 적용했습니다.",
+    "canslim": "최근 분기·연간 EPS 성장률이 각각 25% 이상인 종목만 골라냅니다. 윌리엄 오닐의 CANSLIM 중 실적 관련 3개 요소(C·A·S)를 간이 적용했습니다.",
+}
+
+_STRATEGY_ICONS = {
+    "surge": "📈",
+    "volume_breakout": "🚀",
+    "minervini": "📐",
+    "canslim": "💰",
 }
 
 _STRATEGY_EXTRA_HEADERS = {
@@ -158,8 +212,8 @@ _STRATEGY_EXTRA_HEADERS = {
 }
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard(
+@app.get("/scan", response_class=HTMLResponse)
+def scan_page(
     min_price: float = FastAPIQuery(1.0, ge=0),
     min_market_cap: float = FastAPIQuery(50_000_000, ge=0),
     min_rel_volume: float = FastAPIQuery(1.5, ge=0),
@@ -167,8 +221,10 @@ def dashboard(
     limit: int = FastAPIQuery(50, ge=1, le=200),
     strategy: Strategy = FastAPIQuery("surge"),
 ) -> str:
-    """빠른 확인용 최소 HTML 대시보드. 메인 소비 형태는 /api/scan JSON이다."""
+    """스캔 결과 화면 — 상단에 결과 요약, 하단에 발굴 종목 표. 메인 소비 형태는 /api/scan JSON이다."""
     rows: list[dict[str, Any]] = []
+    final_rows: list[dict[str, Any]] = []
+    total_candidates = 0
     try:
         total_candidates, rows = scan_nasdaq_surge_stocks(
             min_price=min_price,
@@ -178,16 +234,16 @@ def dashboard(
             limit=limit,
         )
         final_rows = _apply_strategy(rows, strategy)
+        summary = _render_summary(strategy, total_candidates, len(rows), final_rows)
         body = _render_rows_html(final_rows, strategy)
         error_banner = ""
     except ScannerError as exc:
-        total_candidates = 0
-        final_rows = []
+        summary = ""
         body = ""
         error_banner = f"<p style='color:#d62828;'>스캔 실패: {html.escape(str(exc))}</p>"
 
     strategy_nav = " | ".join(
-        f"<a href='?strategy={key}'>{'<b>' + label + '</b>' if key == strategy else label}</a>"
+        f"<a href='/scan?strategy={key}'>{'<b>' + label + '</b>' if key == strategy else label}</a>"
         for key, label in _STRATEGY_LABELS.items()
     )
 
@@ -196,13 +252,17 @@ def dashboard(
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<title>NASDAQ Surge Scanner</title>
+<title>{_STRATEGY_ICONS[strategy]} {_STRATEGY_LABELS[strategy]} - NASDAQ Surge Scanner</title>
 <style>
   body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; margin: 32px; background: #fafafa; color: #222; }}
   h1 {{ font-size: 20px; }}
-  .meta {{ color: #666; margin-bottom: 8px; font-size: 14px; }}
+  .back {{ font-size: 13px; margin-bottom: 12px; }}
+  .back a {{ color: #666; text-decoration: none; }}
+  .summary {{ background: #fff; border: 1px solid #eee; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; font-size: 14px; line-height: 1.6; }}
+  .summary p {{ margin: 4px 0; }}
   .nav {{ margin-bottom: 16px; font-size: 13px; }}
   .nav a {{ color: #2a6f97; text-decoration: none; margin-right: 4px; }}
+  .params {{ color: #999; font-size: 12px; margin-bottom: 16px; }}
   table {{ border-collapse: collapse; width: 100%; background: #fff; }}
   th, td {{ padding: 8px 12px; border-bottom: 1px solid #eee; text-align: right; font-size: 13px; }}
   th {{ background: #f0f0f0; text-align: right; }}
@@ -211,18 +271,65 @@ def dashboard(
 </style>
 </head>
 <body>
-  <h1>📈 NASDAQ Surge Scanner</h1>
-  <p class="nav">방법론: {strategy_nav}</p>
-  <p class="meta">조건: 가격≥{min_price}, 시총≥{min_market_cap:,.0f}, 상대거래량≥{min_rel_volume}x, 등락률≥{min_change_pct}%
-    &nbsp;|&nbsp; UW 1차 후보 {total_candidates}개 → 나스닥 {len(rows)}개 → {_STRATEGY_LABELS[strategy]} {len(final_rows)}개
+  <p class="back">&larr; <a href="/">미국 나스닥 스캐너 메인으로</a></p>
+  <h1>{_STRATEGY_ICONS[strategy]} {_STRATEGY_LABELS[strategy]}</h1>
+  <p class="nav">다른 방법론: {strategy_nav}</p>
+  <div class="summary">{summary}{error_banner}</div>
+  <p class="params">조건: 가격≥{min_price}, 시총≥{min_market_cap:,.0f}, 상대거래량≥{min_rel_volume}x, 등락률≥{min_change_pct}%
     &nbsp;|&nbsp; JSON: <code>/api/scan?strategy={strategy}</code></p>
-  {error_banner}
   <table>
     <thead><tr>
       <th>티커</th><th>거래소</th><th>섹터</th><th>등락률</th><th>상대거래량</th><th>시가총액</th>{_STRATEGY_EXTRA_HEADERS[strategy]}
     </tr></thead>
     <tbody>{body}</tbody>
   </table>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def landing() -> str:
+    """메인 페이지 — 방법론별 배너를 클릭하면 각 스캔 화면(/scan?strategy=...)으로 이동한다."""
+    cards = "".join(
+        f"""
+        <a class="card" href="/scan?strategy={key}">
+          <div class="card-icon">{_STRATEGY_ICONS[key]}</div>
+          <div class="card-title">{label}</div>
+          <div class="card-desc">{_STRATEGY_DESCRIPTIONS[key]}</div>
+        </a>
+        """
+        for key, label in _STRATEGY_LABELS.items()
+    )
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>미국 나스닥 스캐너</title>
+<style>
+  body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; margin: 0; background: #fafafa; color: #222; }}
+  .hero {{ padding: 56px 32px 32px; text-align: center; }}
+  .hero h1 {{ font-size: 32px; margin: 0 0 8px; }}
+  .hero p {{ color: #666; font-size: 15px; margin: 0; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; max-width: 1000px; margin: 32px auto; padding: 0 32px 56px; }}
+  .card {{ display: block; background: #fff; border: 1px solid #eee; border-radius: 12px; padding: 24px; text-decoration: none; color: #222; transition: box-shadow 0.15s, transform 0.15s; }}
+  .card:hover {{ box-shadow: 0 4px 16px rgba(0,0,0,0.08); transform: translateY(-2px); }}
+  .card-icon {{ font-size: 32px; margin-bottom: 12px; }}
+  .card-title {{ font-size: 17px; font-weight: 700; margin-bottom: 8px; }}
+  .card-desc {{ font-size: 13px; color: #666; line-height: 1.5; }}
+  .footer {{ text-align: center; color: #999; font-size: 12px; padding-bottom: 40px; }}
+  .footer code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }}
+</style>
+</head>
+<body>
+  <div class="hero">
+    <h1>🇺🇸 미국 나스닥 스캐너</h1>
+    <p>UW(Unusual Whales) + FMP(Financial Modeling Prep) 공식 API 기반. 아래 방법론 중 하나를 선택하세요.</p>
+  </div>
+  <div class="grid">{cards}</div>
+  <p class="footer">JSON API: <code>/api/scan?strategy=surge|volume_breakout|minervini|canslim</code></p>
 </body>
 </html>
 """
