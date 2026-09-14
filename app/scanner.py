@@ -53,16 +53,26 @@ def _normalize_row(raw: dict[str, Any], exchange: str) -> dict[str, Any]:
         return None
 
     ticker = first("ticker", "symbol")
-    change = first("perc_change", "change", "change_perc")
     marketcap = first("marketcap", "market_cap")
-    rel_volume = first("stock_volume_vs_avg30_volume", "volume_vs_avg30_volume")
-    volume = first("volume", "stock_volume")
+    rel_volume = first("relative_volume", "stock_volume_vs_avg30_volume")
+    volume = first("stock_volume", "volume")
     sector = first("sector")
+
+    # UW 스크리너 응답에는 등락률(%) 필드가 직접 내려오지 않는다.
+    # close(현재가)와 prev_close(전일 종가)로 직접 계산한다.
+    change_pct = first("perc_change", "change")
+    if change_pct is not None:
+        change_pct = float(change_pct) * 100
+    else:
+        close = first("close")
+        prev_close = first("prev_close")
+        if close is not None and prev_close is not None and float(prev_close) != 0:
+            change_pct = (float(close) - float(prev_close)) / float(prev_close) * 100
 
     return {
         "ticker": ticker,
         "exchange": exchange,
-        "change_pct": float(change) * 100 if change is not None else None,
+        "change_pct": change_pct,
         "market_cap": float(marketcap) if marketcap is not None else None,
         "relative_volume": float(rel_volume) if rel_volume is not None else None,
         "volume": int(float(volume)) if volume is not None else None,
