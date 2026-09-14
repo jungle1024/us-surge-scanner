@@ -57,6 +57,18 @@ def admin_daily_update(token: str = Query(...)) -> dict:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.get("/recompute-rankings")
+def admin_recompute_rankings(token: str = Query(...)) -> dict:
+    """가격 백필과 별개로, RS 백분위/업종 순위 재계산만 즉시 실행한다(진단·재시도용)."""
+    _check_token(token)
+    try:
+        from app.rs_rating import recompute_rankings
+        updated = recompute_rankings()
+        return {"rs_ratings_updated": updated}
+    except DatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.get("/status")
 def admin_status(token: str = Query(...)) -> dict:
     """
@@ -85,6 +97,18 @@ def admin_status(token: str = Query(...)) -> dict:
                 cur.execute("SELECT count(*) FROM rs_rating_daily")
                 rs_rows = cur.fetchone()[0]
 
+                # 진단: 126거래일(rn=127) 기준을 충족하는 종목이 실제로 몇 개인지 직접 확인
+                cur.execute(
+                    """
+                    SELECT count(*) FROM (
+                        SELECT symbol, count(*) AS days
+                        FROM daily_price GROUP BY symbol
+                        HAVING count(*) >= 127
+                    ) q
+                    """
+                )
+                symbols_eligible_for_rs = cur.fetchone()[0]
+
         return {
             "universe_symbols": universe_count,
             "symbols_with_price_data": symbols_with_price,
@@ -94,6 +118,7 @@ def admin_status(token: str = Query(...)) -> dict:
             "most_complete_symbol": {"symbol": fullest[0], "days_stored": fullest[1]} if fullest else None,
             "total_price_rows": total_rows,
             "rs_rating_rows": rs_rows,
+            "symbols_eligible_for_rs_126d": symbols_eligible_for_rs,
         }
     except DatabaseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
