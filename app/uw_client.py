@@ -25,7 +25,7 @@ def _get_token() -> str:
     token = os.environ.get("UW_API_KEY")
     if not token:
         raise UWClientError(
-            "환경변수 UW_API_KEY이 설정되어 있지 않습니다. "
+            "환경변수 UW_API_KEY가 설정되어 있지 않습니다. "
             "https://unusualwhales.com/information/how-to-check-your-api-usage 에서 발급받은 "
             "API 토큰을 Render 서비스의 환경변수로 등록하세요."
         )

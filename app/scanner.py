@@ -15,9 +15,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.fmp_client import FMPClientError, filter_by_exchange
+from app.fundamentals_client import FundamentalsClientError, get_eps_growth
+from app.technical_client import TechnicalClientError, get_latest_sma
 from app.uw_client import UWClientError, fetch_stock_screener
 
 CACHE_TTL_SECONDS = 30
+
+# 미너비니/CANSLIM은 후보 1개당 UW·FMP를 여러 번 호출하므로, 응답 시간과 API 사용량을
+# 통제하기 위해 이미 등락률 순으로 정렬된 상위 N개 후보에만 적용한다.
+STRATEGY_ENRICH_LIMIT = 15
 
 # UW 후보를 몇 배수로 넉넉히 뽑을지. 나스닥이 아닌 종목이 섞여 있어서 걸러내고 나면
 # 줄어들기 때문에, 최종 limit보다 넉넉히 가져와야 한다.
@@ -57,6 +63,9 @@ def _normalize_row(raw: dict[str, Any], exchange: str) -> dict[str, Any]:
     rel_volume = first("relative_volume", "stock_volume_vs_avg30_volume")
     volume = first("stock_volume", "volume")
     sector = first("sector")
+    week_52_high = first("week_52_high")
+    week_52_low = first("week_52_low")
+    close = first("close")
 
     # UW 스크리너 응답에는 등락률(%) 필드가 직접 내려오지 않는다.
     # close(현재가)와 prev_close(전일 종가)로 직접 계산한다.
@@ -77,6 +86,9 @@ def _normalize_row(raw: dict[str, Any], exchange: str) -> dict[str, Any]:
         "relative_volume": float(rel_volume) if rel_volume is not None else None,
         "volume": int(float(volume)) if volume is not None else None,
         "sector": sector,
+        "close": float(close) if close is not None else None,
+        "week_52_high": float(week_52_high) if week_52_high is not None else None,
+        "week_52_low": float(week_52_low) if week_52_low is not None else None,
         "raw": raw,
     }
 
@@ -158,3 +170,119 @@ def scan_nasdaq_surge_stocks(
         _cache[key] = _CacheEntry(timestamp=now, total_candidates=total_candidates, rows=rows)
 
     return total_candidates, rows
+
+
+# ---------------------------------------------------------------------------
+# 스크리닝 방법론 확장: 거래량 돌파 / 미너비니 추세 템플릿 / CANSLIM 스타일
+#
+# 세 함수 모두 scan_nasdaq_surge_stocks()가 이미 뽑아준 결과(rows)를 입력으로 받아,
+# 그 위에 조건을 더 걸거나 지표를 추가로 붙인 뒤 (필터링된 결과, 판정 근거) 형태로 반환한다.
+# 즉 1차 스크리닝 범위(가격·시총·등락률·상대거래량)는 그대로 두고, "여기서 어떤 스타일에
+# 더 잘 맞는가"를 판정하는 2차 필터다.
+# ---------------------------------------------------------------------------
+
+
+def apply_volume_breakout_filter(
+    rows: list[dict[str, Any]],
+    *,
+    near_high_pct: float = 10.0,
+) -> list[dict[str, Any]]:
+    """
+    거래량 돌파(Volume Breakthrough) 스타일: 52주 신고가 근처에서 거래량이 실린 종목만 남긴다.
+
+    추가 API 호출 없음 — UW 1차 스크리닝 결과에 이미 포함된 52주 고점 필드로 판정한다.
+
+    :param near_high_pct: 52주 고점 대비 몇 % 이내여야 "신고가 근접"으로 볼지 (기본 10%)
+    """
+    result = []
+    for row in rows:
+        close = row.get("close")
+        week_52_high = row.get("week_52_high")
+        if close is None or not week_52_high:
+            continue
+        pct_from_high = (week_52_high - close) / week_52_high * 100
+        if pct_from_high <= near_high_pct:
+            row = {**row, "pct_from_52w_high": pct_from_high}
+            result.append(row)
+    return result
+
+
+def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    미너비니 추세 템플릿(Trend Template)을 간이 적용한다 (원래 8개 조건 중 5개로 축약):
+    1. 현재가 > 50일선 > 150일선 > 200일선 (정배열)
+    2. 현재가가 52주 저점 대비 30% 이상 상승
+    3. 현재가가 52주 고점 대비 25% 이내
+
+    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(UW 호출 3회/종목).
+    minervini_pass가 True/False/None(데이터 부족으로 판정 불가)인 채로 전체를 반환한다 —
+    걸러내는 건 호출부에서 원하는 대로 하도록.
+    """
+    result = []
+    for row in rows[:STRATEGY_ENRICH_LIMIT]:
+        ticker = row.get("ticker")
+        close = row.get("close")
+        week_52_high = row.get("week_52_high")
+        week_52_low = row.get("week_52_low")
+
+        try:
+            sma_50 = get_latest_sma(ticker, 50)
+            sma_150 = get_latest_sma(ticker, 150)
+            sma_200 = get_latest_sma(ticker, 200)
+        except TechnicalClientError as exc:
+            raise ScannerError(f"미너비니 지표 조회 실패({ticker}): {exc}") from exc
+
+        minervini_pass = None
+        if None not in (close, sma_50, sma_150, sma_200, week_52_high, week_52_low):
+            above_low_pct = (close - week_52_low) / week_52_low * 100
+            below_high_pct = (week_52_high - close) / week_52_high * 100
+            minervini_pass = (
+                close > sma_50 > sma_150 > sma_200
+                and above_low_pct >= 30
+                and below_high_pct <= 25
+            )
+
+        result.append({
+            **row,
+            "sma_50": sma_50,
+            "sma_150": sma_150,
+            "sma_200": sma_200,
+            "minervini_pass": minervini_pass,
+        })
+    return result
+
+
+def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    CANSLIM 스타일을 간이 적용한다 (7글자 중 C·A·S 3개로 축약):
+    - C: 최근 분기 EPS가 전년 동기 대비 25% 이상 성장
+    - A: 최근 회계연도 EPS가 전년 대비 25% 이상 성장
+    - S: 상대거래량 1.5배 이상 (수급 — 이미 1차 스크리닝 조건으로 충족된 경우가 많음)
+
+    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(FMP 호출 2회/종목).
+    canslim_pass가 True/False/None(데이터 부족)인 채로 전체를 반환한다.
+    """
+    result = []
+    for row in rows[:STRATEGY_ENRICH_LIMIT]:
+        ticker = row.get("ticker")
+        rel_volume = row.get("relative_volume")
+
+        try:
+            eps_growth = get_eps_growth(ticker)
+        except FundamentalsClientError as exc:
+            raise ScannerError(f"CANSLIM 지표 조회 실패({ticker}): {exc}") from exc
+
+        quarterly_yoy = eps_growth["quarterly_yoy_pct"]
+        annual_yoy = eps_growth["annual_yoy_pct"]
+
+        canslim_pass = None
+        if None not in (quarterly_yoy, annual_yoy, rel_volume):
+            canslim_pass = quarterly_yoy >= 25 and annual_yoy >= 25 and rel_volume >= 1.5
+
+        result.append({
+            **row,
+            "eps_quarterly_yoy_pct": quarterly_yoy,
+            "eps_annual_yoy_pct": annual_yoy,
+            "canslim_pass": canslim_pass,
+        })
+    return result

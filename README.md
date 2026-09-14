@@ -17,13 +17,13 @@ UW(Unusual Whales)와 FMP(Financial Modeling Prep)의 **공식 REST API**만 사
 
 | 키 | 어디서 발급 | 환경변수 이름 |
 |---|---|---|
-| UW API 토큰 | https://unusualwhales.com/information/how-to-check-your-api-usage | `UW_API_TOKEN` |
+| UW API 토큰 | https://unusualwhales.com/information/how-to-check-your-api-usage | `UW_API_KEY` |
 | FMP API 키 | FMP 대시보드(기존 급등주 발굴 V1에서 쓰던 키 재사용 가능) | `FMP_API_KEY` |
 
 ## 로컬 실행
 
 ```bash
-export UW_API_TOKEN=여기에_UW_토큰
+export UW_API_KEY=여기에_UW_토큰
 export FMP_API_KEY=여기에_FMP_키
 pip install -r requirements.txt
 uvicorn app.main:app --reload
@@ -73,7 +73,28 @@ GET /api/scan?min_change_pct=10&min_rel_volume=2&limit=30
 | `min_rel_volume` | 1.5 | 최소 상대거래량 배수(30일 평균 대비) |
 | `min_change_pct` | 5.0 | 최소 당일 등락률(%) |
 | `max_change_pct` | 없음 | 최대 당일 등락률(%) |
-| `limit` | 50 | 최종 반환할 나스닥 종목 최대 개수(최대 200) |
+| `limit` | 50 | 1차 스캔에서 최종 반환할 나스닥 종목 최대 개수(최대 200) |
+| `strategy` | surge | 스크리닝 방법론: `surge` / `volume_breakout` / `minervini` / `canslim` |
+
+## 스크리닝 방법론 (strategy)
+
+1차 스캔(가격·시총·등락률·상대거래량)으로 나스닥 급등 후보를 뽑은 뒤, `strategy` 값에 따라 추가 조건을 적용합니다.
+
+- **surge** (기본값): 추가 조건 없음. 순수 등락률·거래량 급등주.
+- **volume_breakout**: 52주 신고가 대비 10% 이내 + 거래량 실림. 추가 API 호출 없음(1차 스캔 데이터로 판정).
+- **minervini**: 미너비니 추세 템플릿을 5개 조건으로 간이 적용 — 현재가 > 50일선 > 150일선 > 200일선 정배열, 52주 저점 대비 30%+ 상승, 52주 고점 대비 25% 이내. 상위 15개 후보에 대해서만 UW 이동평균(SMA)을 조회합니다(종목당 3회 호출).
+- **canslim**: CANSLIM을 3개 요소(C·A·S)로 간이 적용 — 분기 EPS 전년동기 대비 25%+ 성장, 연간 EPS 전년 대비 25%+ 성장, 상대거래량 1.5배 이상. 상위 15개 후보에 대해서만 FMP 재무제표를 조회합니다(종목당 2회 호출).
+
+⚠️ `minervini`/`canslim`은 원래 방법론(미너비니 8개 조건, CANSLIM 7개 글자)을 그대로 구현한 것이 아니라, 현재 API로 계산 가능한 핵심 조건만 추린 **간이 버전**입니다. 정밀한 매매 판단 근거로 쓰기보다는 후보를 좁히는 참고 지표로 활용하세요.
+
+예시:
+```
+GET /api/scan?strategy=minervini&limit=30
+GET /api/scan?strategy=canslim&min_change_pct=3
+GET /api/scan?strategy=volume_breakout
+```
+
+대시보드(`/`)에서도 상단 방법론 링크를 클릭해 전환할 수 있습니다.
 
 ## Render 배포
 
@@ -82,7 +103,7 @@ GET /api/scan?min_change_pct=10&min_rel_volume=2&limit=30
 1. GitHub에 이 프로젝트를 업로드
 2. Render 대시보드 → New → Blueprint → 리포지토리 선택
 3. `render.yaml`이 자동 인식되어 `nasdaq-surge-scanner` 웹 서비스가 생성됨
-4. **배포 전에 반드시** Render 서비스의 Environment 탭에서 `UW_API_TOKEN`, `FMP_API_KEY` 값을
+4. **배포 전에 반드시** Render 서비스의 Environment 탭에서 `UW_API_KEY`, `FMP_API_KEY` 값을
    입력해야 합니다(`sync: false`로 설정되어 있어 Render가 값을 직접 물어봅니다).
 5. 배포 완료 후 `https://<서비스명>.onrender.com/api/scan` 으로 접근
 
