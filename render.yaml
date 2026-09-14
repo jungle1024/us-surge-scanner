@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nasdaq-surge-scanner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: UW_API_TOKEN
+        sync: false
+      - key: FMP_API_KEY
+        sync: false
+    autoDeploy: true
