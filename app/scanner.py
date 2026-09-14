@@ -19,6 +19,7 @@ from app.fmp_client import FMPClientError, filter_by_exchange, get_institutional
 from app.fundamentals_client import FundamentalsClientError, get_eps_growth
 from app.market_client import MarketClientError, get_market_direction
 from app.news_client import NewsClientError, fetch_recent_headlines
+from app.rs_rating import get_rs_rating
 from app.technical_client import TechnicalClientError, get_latest_sma, get_sma_trend
 from app.uw_client import UWClientError, fetch_stock_screener
 
@@ -216,13 +217,16 @@ def apply_volume_breakout_filter(
 
 def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    미너비니 추세 템플릿(Trend Template)을 간이 적용한다 (원래 8개 조건 중 6개로 축약):
+    미너비니 추세 템플릿(Trend Template)을 적용한다 (원래 8개 조건 중 7개):
     1. 현재가 > 50일선 > 150일선 > 200일선 (정배열)
     2. 현재가가 52주 저점 대비 30% 이상 상승
     3. 현재가가 52주 고점 대비 25% 이내
     4. 200일선이 최소 1개월(21거래일)간 상승 추세
+    5. RS Rating(나스닥 전체 대비 상대강도) 70 이상 — 전용 DB(nasdaq-universe-db)에서 조회.
+       DB에 아직 126거래일치 데이터가 쌓이지 않았으면 이 조건은 건너뛰고 1~4번만으로 판정한다
+       (rs_percentile이 응답에 None으로 표시되면 "아직 판정 제외 중"이라는 뜻).
 
-    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(UW 호출 4회/종목).
+    상위 STRATEGY_ENRICH_LIMIT개 후보에만 적용(UW 호출 4회/종목 + RS Rating DB 조회 1회).
     minervini_pass가 True/False/None(데이터 부족으로 판정 불가)인 채로 전체를 반환한다 —
     걸러내는 건 호출부에서 원하는 대로 하도록.
     """
@@ -246,16 +250,25 @@ def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             sma_200_now, sma_200_past = sma_200_trend
             sma_200_rising = sma_200_now > sma_200_past
 
-        minervini_pass = None
+        rs = get_rs_rating(ticker)
+        rs_percentile = rs["rs_percentile"] if rs else None
+
+        core_pass = None
         if None not in (close, sma_50, sma_150, sma_200, week_52_high, week_52_low, sma_200_rising):
             above_low_pct = (close - week_52_low) / week_52_low * 100
             below_high_pct = (week_52_high - close) / week_52_high * 100
-            minervini_pass = (
+            core_pass = (
                 close > sma_50 > sma_150 > sma_200
                 and above_low_pct >= 30
                 and below_high_pct <= 25
                 and sma_200_rising
             )
+
+        # RS Rating 데이터가 아직 없으면(초기 데이터 축적 기간) 이 조건 없이 core_pass만으로 판정한다.
+        if core_pass is not None and rs_percentile is not None:
+            minervini_pass = core_pass and rs_percentile >= 70
+        else:
+            minervini_pass = core_pass
 
         result.append({
             **row,
@@ -263,6 +276,7 @@ def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "sma_150": sma_150,
             "sma_200": sma_200,
             "sma_200_rising": sma_200_rising,
+            "rs_percentile": rs_percentile,
             "minervini_pass": minervini_pass,
         })
     return result
@@ -270,16 +284,17 @@ def enrich_with_minervini(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    CANSLIM 스타일을 간이 적용한다 (7글자 중 C·A·S·M·I·N 6개로 확장, L만 제외):
+    CANSLIM 스타일을 적용한다 (7글자 전체: C·A·N·S·L·I·M):
     - C: 최근 분기 EPS가 전년 동기 대비 25% 이상 성장
     - A: 최근 회계연도 EPS가 전년 대비 25% 이상 성장
-    - S: 상대거래량 1.5배 이상 (수급)
-    - M: 시장 전체(QQQ)가 50일선 위 — 상승장에서만 유효한 전략이라는 원 취지를 반영
-    - I: 기관 보유 비중이 직전 분기 대비 증가
     - N: 최근 뉴스에 '새로운 촉매'(신제품/신경영진/긍정적 이벤트 등)가 있는지 Claude가 판정
-    - L(업종 내 상대강도 리더십)은 나스닥 전 종목 순위가 필요해 이 구조로는 계산할 수 없어 제외.
+    - S: 상대거래량 1.5배 이상 (수급)
+    - L: 업종 내 상대강도 순위 70퍼센타일 이상 — 전용 DB(nasdaq-universe-db)에서 조회.
+      DB에 아직 데이터가 부족하면 이 조건은 건너뛰고 나머지만으로 판정한다.
+    - I: 기관 보유 비중이 직전 분기 대비 증가
+    - M: 시장 전체(QQQ)가 50일선 위 — 상승장에서만 유효한 전략이라는 원 취지를 반영
 
-    상위 CANSLIM_ENRICH_LIMIT개 후보에만 적용(종목당 FMP 3회 + 뉴스 1회 + Claude 1회 호출).
+    상위 CANSLIM_ENRICH_LIMIT개 후보에만 적용(종목당 FMP 3회 + 뉴스 1회 + Claude 1회 + RS DB 조회 1회).
     canslim_pass가 True/False/None(데이터 부족)인 채로 전체를 반환한다.
     """
     try:
@@ -317,10 +332,13 @@ def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         is_new = new_catalyst["is_new"] if new_catalyst else None
         new_catalyst_reason = new_catalyst["reason"] if new_catalyst else None
 
-        canslim_pass = None
-        conditions = (quarterly_yoy, annual_yoy, rel_volume, market_bullish, institutional_buying, is_new)
-        if None not in conditions:
-            canslim_pass = (
+        rs = get_rs_rating(ticker)
+        sector_rank_pct = rs["sector_rank_pct"] if rs else None
+
+        core_pass = None
+        core_conditions = (quarterly_yoy, annual_yoy, rel_volume, market_bullish, institutional_buying, is_new)
+        if None not in core_conditions:
+            core_pass = (
                 quarterly_yoy >= 25
                 and annual_yoy >= 25
                 and rel_volume >= 1.5
@@ -328,6 +346,12 @@ def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 and institutional_buying
                 and is_new
             )
+
+        # 업종 내 순위 데이터가 아직 없으면(초기 데이터 축적 기간) 이 조건 없이 core_pass만으로 판정한다.
+        if core_pass is not None and sector_rank_pct is not None:
+            canslim_pass = core_pass and sector_rank_pct >= 70
+        else:
+            canslim_pass = core_pass
 
         result.append({
             **row,
@@ -338,6 +362,7 @@ def enrich_with_canslim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "institutional_ownership_pct_change": ownership_pct_change,
             "new_catalyst": is_new,
             "new_catalyst_reason": new_catalyst_reason,
+            "sector_rank_pct": sector_rank_pct,
             "canslim_pass": canslim_pass,
         })
     return result

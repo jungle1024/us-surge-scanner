@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Query as FastAPIQuery
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+from app.admin import router as admin_router
 from app.scanner import (
     ScannerError,
     apply_volume_breakout_filter,
@@ -35,6 +36,8 @@ app = FastAPI(
     description="UW + FMP 공식 API 기반 나스닥 거래량·변동률 급등주 스캐너",
     version="2.1.0",
 )
+
+app.include_router(admin_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,7 +106,7 @@ def api_scan(
 
 
 def _render_rows_html(rows: list[dict[str, Any]], strategy: Strategy) -> str:
-    colspan = {"surge": 6, "volume_breakout": 7, "minervini": 9, "canslim": 10}[strategy]
+    colspan = {"surge": 6, "volume_breakout": 7, "minervini": 10, "canslim": 11}[strategy]
     if not rows:
         return f"<tr><td colspan='{colspan}' style='text-align:center;padding:24px;color:#888;'>조건에 맞는 나스닥 종목이 없습니다.</td></tr>"
 
@@ -132,6 +135,7 @@ def _render_rows_html(rows: list[dict[str, Any]], strategy: Strategy) -> str:
             base += (
                 f"<td>{fmt(r.get('sma_50'), '.2f')} / {fmt(r.get('sma_150'), '.2f')} / {fmt(r.get('sma_200'), '.2f')}</td>"
                 f"<td>{esc(r.get('sma_200_rising'))}</td>"
+                f"<td>{fmt(r.get('rs_percentile'), '.0f')}</td>"
                 f"<td>{esc(r.get('minervini_pass'))}</td>"
             )
         elif strategy == "canslim":
@@ -140,6 +144,7 @@ def _render_rows_html(rows: list[dict[str, Any]], strategy: Strategy) -> str:
                 f"<td>{esc(r.get('market_bullish'))}</td>"
                 f"<td>{fmt(r.get('institutional_ownership_pct_change'), '+.2f')}%p</td>"
                 f"<td title='{esc(r.get('new_catalyst_reason'))}'>{esc(r.get('new_catalyst'))}</td>"
+                f"<td>{fmt(r.get('sector_rank_pct'), '.0f')}</td>"
                 f"<td>{esc(r.get('canslim_pass'))}</td>"
             )
         base += "</tr>"
@@ -199,8 +204,8 @@ _STRATEGY_LABELS = {
 _STRATEGY_DESCRIPTIONS = {
     "surge": "오늘 등락률·거래량이 급격히 튄 나스닥 종목을 그대로 모아 보여줍니다. 추가 판정 없이 순위만 매깁니다.",
     "volume_breakout": "급등 후보 중에서도 52주 신고가 근처(10% 이내)까지 도달한 종목만 골라냅니다. '많이 올랐지만 아직 눌려있는' 종목과 '신고가를 뚫는' 종목을 구분합니다.",
-    "minervini": "이동평균(50/150/200일)이 짧은 기간일수록 위에 있는 정배열 구조이면서, 200일선이 1개월 이상 상승 추세인 종목만 골라냅니다. 마크 미너비니의 추세 템플릿을 6개 핵심 조건으로 간이 적용했습니다.",
-    "canslim": "실적 성장(C·A), 거래량(S), 시장 전체 방향(M), 기관 매수(I), 뉴스 속 신규 촉매(N, Claude가 판정)까지 6개 조건을 모두 만족하는 종목만 골라냅니다. 윌리엄 오닐의 CANSLIM 7개 요소 중 업종 리더십(L)만 제외하고 간이 적용했습니다.",
+    "minervini": "이동평균 정배열, 200일선 상승 추세에 더해 RS Rating(나스닥 전체 대비 상대강도, 전용 DB 기반)까지 반영합니다. 마크 미너비니의 추세 템플릿 8개 조건 중 7개를 적용했습니다. RS Rating은 DB에 6개월치 데이터가 쌓이기 전까지는 판정에서 빠집니다.",
+    "canslim": "실적 성장(C·A), 거래량(S), 업종 내 상대강도(L, 전용 DB 기반), 기관 매수(I), 시장 전체 방향(M), 뉴스 속 신규 촉매(N, Claude가 판정)까지 윌리엄 오닐의 CANSLIM 7개 요소를 모두 적용했습니다. L은 DB에 데이터가 쌓이기 전까지는 판정에서 빠집니다.",
 }
 
 _STRATEGY_ICONS = {
@@ -213,8 +218,8 @@ _STRATEGY_ICONS = {
 _STRATEGY_EXTRA_HEADERS = {
     "surge": "",
     "volume_breakout": "<th>52주 고점 대비</th>",
-    "minervini": "<th>SMA 50/150/200</th><th>200일선 상승중</th><th>미너비니 통과</th>",
-    "canslim": "<th>EPS 성장(분기/연간)</th><th>시장 방향(M)</th><th>기관 보유 변화(I)</th><th>신규 촉매(N)</th><th>CANSLIM 통과</th>",
+    "minervini": "<th>SMA 50/150/200</th><th>200일선 상승중</th><th>RS Rating</th><th>미너비니 통과</th>",
+    "canslim": "<th>EPS 성장(분기/연간)</th><th>시장 방향(M)</th><th>기관 보유 변화(I)</th><th>신규 촉매(N)</th><th>업종 순위(L)</th><th>CANSLIM 통과</th>",
 }
 
 
