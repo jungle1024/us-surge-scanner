@@ -89,6 +89,35 @@ def _backfill_via_per_ticker(
         time.sleep(0.15)
 
 
+def _load_universe_from_db() -> list[dict] | None:
+    """DB에 최근(7일 이내) 유니버스가 있으면 그걸 그대로 돌려준다. 없거나 오래됐으면 None."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol, company_name, sector, updated_at FROM nasdaq_universe")
+            rows = cur.fetchall()
+    if not rows or (date.today() - min(r[3] for r in rows)) > timedelta(days=7):
+        return None
+    return [{"symbol": r[0], "company_name": r[1], "sector": r[2]} for r in rows]
+
+
+def _get_universe(log: list[str]) -> list[dict]:
+    """
+    유니버스를 가져온다. DB에 최근 데이터가 있으면 FMP를 아예 호출하지 않고 재사용한다.
+    (예전엔 /admin/backfill을 부를 때마다 매번 FMP에 전체 목록을 새로 물어봤는데,
+    이 호출이 느려지거나 멈추면 요청 전체가 먹통이 되는 문제가 있었다 — 이제는 DB부터 본다.)
+    """
+    cached = _load_universe_from_db()
+    if cached is not None:
+        log.append(f"2) 유니버스는 DB 캐시 재사용 ({len(cached)}종목, FMP 재조회 안 함)")
+        return cached
+
+    log.append("2) 나스닥 보통주 유니버스 조회 (DB 캐시 없음/오래됨 — FMP 호출)")
+    universe = fetch_nasdaq_common_stock_universe()
+    log.append(f"   유니버스 {len(universe)}종목 확보")
+    _save_universe(universe)
+    return universe
+
+
 def run_backfill(
     *, days: int = 5, offset: int = 0, max_tickers: int | None = 30, ticker_offset: int = 0
 ) -> dict[str, Any]:
@@ -110,10 +139,7 @@ def run_backfill(
     log.append("1) 스키마 확인/생성")
     init_schema()
 
-    log.append("2) 나스닥 보통주 유니버스 조회")
-    universe = fetch_nasdaq_common_stock_universe()
-    log.append(f"   유니버스 {len(universe)}종목 확보")
-    _save_universe(universe)
+    universe = _get_universe(log)
     universe_symbols = {u["symbol"] for u in universe}
 
     anchor = date.today() - timedelta(days=1)
@@ -151,19 +177,8 @@ def run_daily_update() -> dict[str, Any]:
     log.append("1) 스키마 확인")
     init_schema()
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT symbol, updated_at FROM nasdaq_universe")
-            rows = cur.fetchall()
-
-    if not rows or (date.today() - min(r[1] for r in rows)) > timedelta(days=7):
-        log.append("2) 유니버스 갱신(7일 이상 경과 또는 최초 실행)")
-        universe = fetch_nasdaq_common_stock_universe()
-        _save_universe(universe)
-        symbols = {u["symbol"] for u in universe}
-    else:
-        symbols = {r[0] for r in rows}
-        log.append(f"2) 유니버스 최신 상태 유지 ({len(symbols)}종목)")
+    universe = _get_universe(log)
+    symbols = {u["symbol"] for u in universe}
 
     today = date.today()
     log.append(f"3) {today} 가격 조회")

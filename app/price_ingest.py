@@ -19,7 +19,7 @@ from datetime import date, timedelta
 import requests
 
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
-_TIMEOUT_SECONDS = 30
+_TIMEOUT_SECONDS = 15
 
 
 class PriceIngestError(RuntimeError):
