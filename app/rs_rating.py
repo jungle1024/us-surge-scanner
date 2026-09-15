@@ -19,13 +19,19 @@ from app.db import DatabaseError, get_connection
 RETENTION_TRADING_DAYS = 280
 
 
-def upsert_daily_prices(price_date: date, prices: dict[str, float]) -> int:
-    """{심볼: 종가} 를 해당 날짜의 daily_price 행으로 저장(UPSERT)한다. 저장된 행 수를 반환."""
+def upsert_daily_prices(price_date: date, prices: dict[str, float], conn=None) -> int:
+    """
+    {심볼: 종가} 를 해당 날짜의 daily_price 행으로 저장(UPSERT)한다. 저장된 행 수를 반환.
+    conn을 넘기면 그 커넥션을 그대로 쓰고(커밋은 호출부 책임), 안 넘기면 새로 열고 닫는다.
+    한 요청 안에서 종목을 여러 번 upsert할 땐 반드시 conn을 넘겨서 재사용할 것 —
+    매번 새 커넥션을 여는 건 작은 DB 인스턴스에 큰 부담이 된다.
+    """
     if not prices:
         return 0
     rows = [(symbol, price_date, close) for symbol, close in prices.items()]
-    with get_connection() as conn:
-        with conn.cursor() as cur:
+
+    def _do(c):
+        with c.cursor() as cur:
             psycopg2.extras.execute_values(
                 cur,
                 """
@@ -35,8 +41,12 @@ def upsert_daily_prices(price_date: date, prices: dict[str, float]) -> int:
                 """,
                 rows,
             )
-            written = cur.rowcount
-    return written
+            return cur.rowcount
+
+    if conn is not None:
+        return _do(conn)
+    with get_connection() as c:
+        return _do(c)
 
 
 def prune_old_prices() -> int:
@@ -111,17 +121,22 @@ ON CONFLICT (symbol, price_date) DO UPDATE SET
 """
 
 
-def recompute_rankings() -> int:
+def recompute_rankings(conn=None) -> int:
     """
     daily_price에 쌓인 데이터로 전 종목의 RS 백분위·업종 내 순위를 다시 계산해서
     rs_rating_daily에 저장한다. 126거래일(6개월)치가 없는 종목은 계산에서 빠진다
     (데이터가 아직 부족한 초기 몇 달은 결과가 없을 수 있음 — 정상).
+    conn을 넘기면 그 커넥션을 재사용한다(새 커넥션을 열지 않음).
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
+    def _do(c):
+        with c.cursor() as cur:
             cur.execute(_RECOMPUTE_SQL)
-            updated = cur.rowcount
-    return updated
+            return cur.rowcount
+
+    if conn is not None:
+        return _do(conn)
+    with get_connection() as c:
+        return _do(c)
 
 
 def get_rs_rating(symbol: str) -> dict[str, Any] | None:
