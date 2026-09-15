@@ -148,7 +148,7 @@ def run_backfill(
             log.append("이 구간에 해당하는 거래일이 없습니다(offset이 너무 큼).")
             return {"log": log}
 
-        log.append(f"3) 가격 백필 ({trading_days[-1]} ~ {trading_days[0]}, {len(trading_days)}거래일)")
+        log.append("3) 가격 백필 ({} ~ {}, {}거래일)".format(trading_days[-1], trading_days[0], len(trading_days)))
         bulk_ok = _backfill_via_bulk(trading_days, universe_symbols, log, conn)
         if not bulk_ok:
             log.append("4) 종목별 방식으로 백필")
@@ -157,15 +157,15 @@ def run_backfill(
                 max_tickers=max_tickers, ticker_offset=ticker_offset,
             )
 
-        log.append("5) RS 백분위/업종 순위 재계산")
-        updated = recompute_rankings(conn=conn)
-        log.append(f"   {updated}개 종목 랭킹 계산 완료")
+        log.append(
+            "5) RS 재계산은 생략 — 전체 종목을 다시 계산하는 무거운 작업이라 백필 배치마다 돌리지 않는다. "
+            "다 채운 뒤 /admin/recompute-rankings를 한 번만 호출할 것."
+        )
 
     return {
         "universe_size": len(universe),
         "trading_days_covered": [d.isoformat() for d in trading_days],
         "bulk_endpoint_available": bulk_ok,
-        "rs_ratings_updated": updated,
         "log": log,
     }
 
