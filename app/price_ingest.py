@@ -106,7 +106,7 @@ def fetch_today_quotes_nasdaq() -> dict[str, float]:
     api_key = _get_api_key()
     try:
         resp = requests.get(
-            f"{FMP_BASE_URL}/quote",
+            f"{FMP_BASE_URL}/batch-exchange-quote",
             params={"exchange": "NASDAQ", "apikey": api_key},
             timeout=_TIMEOUT_SECONDS,
         )
